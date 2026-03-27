@@ -669,19 +669,6 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
     filing_texts = []
 
     # EDGAR older filings (sequential — SEC rate limit)
-    # Pre-filter: most 8-Ks are NOT earnings releases. Quarterly earnings are
-    # typically filed within ~5 days of month-end in Jan, Mar-Apr, Jun-Jul, Sep-Oct.
-    # We also keep any filing already in our cache to avoid re-filtering.
-    def _likely_earnings_date(date_str: str) -> bool:
-        """Heuristic: is this filing date consistent with a quarterly earnings release?"""
-        try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            # Earnings are typically filed in: Jan, Feb (Q4), Apr, May (Q1),
-            # Jul, Aug (Q2), Oct, Nov (Q3). Skip Mar, Jun, Sep, Dec.
-            return dt.month in (1, 2, 4, 5, 7, 8, 10, 11)
-        except (ValueError, TypeError):
-            return True  # Can't parse — fetch it to be safe
-
     if edgar_filings:
         # Check cache first — already-parsed filings don't need re-fetching
         cached_dates = set()
@@ -690,20 +677,11 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
             if _cache_get(ticker, fd):
                 cached_dates.add(fd)
 
-        # Filter to likely earnings + already cached
-        filtered_edgar = [f for f in edgar_filings
-                          if f["filing_date"] in cached_dates
-                          or _likely_earnings_date(f["filing_date"])]
+        log(f"Fetching {len(edgar_filings)} older EDGAR 8-K exhibit texts...")
 
-        skipped = len(edgar_filings) - len(filtered_edgar)
-        if skipped > 0:
-            log(f"Fetching {len(filtered_edgar)} likely-earnings EDGAR filings (skipped {skipped} non-earnings)...")
-        else:
-            log(f"Fetching {len(filtered_edgar)} older EDGAR 8-K exhibit texts...")
-
-        for i, filing in enumerate(filtered_edgar):
+        for i, filing in enumerate(edgar_filings):
             fd = filing.get("filing_date", "?")
-            log(f"  Fetching EDGAR filing {i+1}/{len(filtered_edgar)}...")
+            log(f"  Fetching EDGAR filing {i+1}/{len(edgar_filings)}...")
 
             # Skip if already cached (just need to recover from cache later)
             if fd in cached_dates:
