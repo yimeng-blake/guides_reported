@@ -37,14 +37,24 @@ from openpyxl.chart import BarChart, Reference, LineChart, ScatterChart
 from openpyxl.chart.series import DataPoint
 
 # ── Config ──────────────────────────────────────────────────────────────
-# Read API keys from Streamlit secrets (cloud) or fall back to env vars / hardcoded (local dev)
-def _get_secret(key: str, fallback: str = "") -> str:
-    """Read from st.secrets → env var → fallback."""
+# Read API keys from Streamlit secrets (cloud) or fall back to env vars (local dev)
+def _get_secret(key: str) -> str:
+    """Read from st.secrets → env var. Raises if neither is set."""
+    # Try Streamlit secrets first
     try:
         import streamlit as st
-        return st.secrets.get(key, os.environ.get(key, fallback))
+        if hasattr(st, "secrets") and key in st.secrets:
+            return st.secrets[key]
     except Exception:
-        return os.environ.get(key, fallback)
+        pass
+    # Fall back to environment variable
+    val = os.environ.get(key, "")
+    if not val:
+        raise RuntimeError(
+            f"Missing required secret: {key}. "
+            f"Set it in .streamlit/secrets.toml or as an environment variable."
+        )
+    return val
 
 FD_API_KEY = _get_secret("FD_API_KEY")
 CLAUDE_API_KEY = _get_secret("ANTHROPIC_API_KEY")
@@ -133,6 +143,8 @@ def fetch_8k_filings(ticker: str, limit: int = 200) -> list[dict]:
     r = requests.get(f"{BASE_URL}/filings",
         params={"ticker": ticker, "filing_type": "8-K", "limit": limit},
         headers=HEADERS)
+    if r.status_code == 401 or r.status_code == 403:
+        raise RuntimeError(f"FD API authentication failed (HTTP {r.status_code}). Check your FD_API_KEY.")
     r.raise_for_status()
     return r.json().get("filings", [])
 
