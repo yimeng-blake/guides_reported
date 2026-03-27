@@ -98,7 +98,7 @@ class RateLimiter:
     def current_interval(self):
         return self._interval
 
-_fd_rate_limiter = RateLimiter(min_interval=0.6, max_interval=5.0)
+_fd_rate_limiter = RateLimiter(min_interval=1.0, max_interval=8.0)
 
 # ── Styles ──────────────────────────────────────────────────────────────
 BEAT_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -561,10 +561,19 @@ def llm_parse_filing(text: str, ticker: str, log_fn=None) -> dict | None:
             if log_fn:
                 log_fn(msg)
             time.sleep(wait)
+        except anthropic.APIStatusError as e:
+            # Retry on 500/502/503/529 (transient server errors)
+            if e.status_code in (500, 502, 503, 529) and attempt < 3:
+                wait = 10 * (attempt + 1)
+                print(f"    API error {e.status_code}, retrying in {wait}s (attempt {attempt+1}/4)...")
+                time.sleep(wait)
+            else:
+                print(f"    LLM API error (non-retryable): {e}")
+                return None
         except Exception as e:
             print(f"    LLM parse error: {e}")
             return None
-    print(f"    Failed after 4 rate-limit retries")
+    print(f"    Failed after 4 retries")
     return None
 
 
@@ -701,18 +710,21 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
     total_primary = len(filings)
     log(f"Fetching {total_primary} 8-K exhibit texts from primary API...")
 
+    _FETCH_SKIPPED = "SKIPPED"  # Sentinel: text fetched but not earnings
+
     def _fetch_primary_text(filing):
         acc = filing["accession_number"]
         fd = filing.get("report_date", "?")
         try:
             text = fetch_exhibit_text(ticker, acc)
         except Exception:
-            return None
+            return None  # Genuine fetch failure
         if text and is_earnings_8k_quick(text):
             return (fd, text)
         if text:
             print(f"  [skipped] {fd} — failed earnings heuristic")
-        return None
+            return _FETCH_SKIPPED  # Not earnings — don't retry
+        return None  # No text returned — fetch failed
 
     fetch_done = [0]
     failed_filings = []
@@ -724,10 +736,12 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
                 log(f"  Fetched {fetch_done[0]}/{total_primary} exhibit texts...")
             try:
                 result = future.result()
-                if result:
+                if result and result != _FETCH_SKIPPED:
                     filing_texts.append(result)
-                else:
+                elif result is None:
+                    # Genuine fetch failure — worth retrying
                     failed_filings.append(futures[future])
+                # _FETCH_SKIPPED means not earnings — don't retry
             except Exception as e:
                 filing = futures[future]
                 failed_filings.append(filing)
