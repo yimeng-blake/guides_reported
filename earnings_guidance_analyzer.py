@@ -150,7 +150,7 @@ def fetch_8k_filings(ticker: str, limit: int = 200) -> list[dict]:
 
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
-def fetch_exhibit_text(ticker: str, accession: str, retries: int = 3) -> str | None:
+def fetch_exhibit_text(ticker: str, accession: str, retries: int = 5) -> str | None:
     for attempt in range(retries + 1):
         try:
             r = requests.get(f"{BASE_URL}/filings/items",
@@ -613,8 +613,11 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
         return None
 
     fetch_done = [0]
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        futures = {pool.submit(_fetch_primary_text, f): f for f in filings}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {}
+        for f in filings:
+            futures[pool.submit(_fetch_primary_text, f)] = f
+            time.sleep(0.3)  # Stagger submissions to reduce 429s
         for future in as_completed(futures):
             fetch_done[0] += 1
             if fetch_done[0] % 10 == 0 or fetch_done[0] == total_primary:
