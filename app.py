@@ -605,60 +605,55 @@ with st.sidebar:
                 except Exception as e:
                     st.error(f"Failed to add {_new_t}: {e}")
 
-        try:
-            watchlist = _db.get_watchlist()
-            active_jobs = _db.get_active_ingestion_jobs()
-            active_tickers = {j["ticker"] for j in active_jobs}
-            has_active = False
+        @st.fragment(run_every=5)
+        def _watchlist_status():
+            """Auto-refreshing watchlist fragment — polls DB every 5s."""
+            try:
+                watchlist = _db.get_watchlist()
+                active_jobs = _db.get_active_ingestion_jobs()
+                active_tickers = {j["ticker"] for j in active_jobs}
 
-            for entry in watchlist:
-                t = entry["ticker"]
-                if t in active_tickers:
-                    has_active = True
-                    job = next(j for j in active_jobs if j["ticker"] == t)
-                    pct = job.get("progress", 0) or 0
-                    msg = job.get("message", "Ingesting...")
-                    st.markdown(f"⏳ **{t}** — {msg}")
-                    st.progress(pct / 100)
-                elif entry.get("last_ingested_at"):
-                    st.markdown(f"✅ **{t}**")
-                else:
-                    # Ticker in watchlist but never ingested (or ingestion failed)
-                    col_lbl, col_btn = st.columns([3, 1])
-                    with col_lbl:
-                        st.markdown(f"⏸️ **{t}**")
-                    with col_btn:
-                        if st.button("Ingest", key=f"ingest_{t}", use_container_width=True):
-                            try:
-                                _job_id = _db.create_ingestion_job(t)
-                                import threading
-                                from ingest import ingest_ticker as _ingest_fn
+                for entry in watchlist:
+                    t = entry["ticker"]
+                    if t in active_tickers:
+                        job = next(j for j in active_jobs if j["ticker"] == t)
+                        pct = job.get("progress", 0) or 0
+                        msg = job.get("message", "Ingesting...")
+                        st.markdown(f"⏳ **{t}** — {msg}")
+                        st.progress(pct / 100)
+                    elif entry.get("last_ingested_at"):
+                        st.markdown(f"✅ **{t}**")
+                    else:
+                        col_lbl, col_btn = st.columns([3, 1])
+                        with col_lbl:
+                            st.markdown(f"⏸️ **{t}**")
+                        with col_btn:
+                            if st.button("Ingest", key=f"ingest_{t}", use_container_width=True):
+                                try:
+                                    _job_id = _db.create_ingestion_job(t)
+                                    import threading
+                                    from ingest import ingest_ticker as _ingest_fn
 
-                                def _bg_ingest(ticker, jid):
-                                    try:
-                                        _ingest_fn(ticker, job_id=jid)
-                                    except Exception as e:
-                                        print(f"[bg-ingest] {ticker} failed: {e}")
+                                    def _bg_ingest(ticker, jid):
+                                        try:
+                                            _ingest_fn(ticker, job_id=jid)
+                                        except Exception as e:
+                                            print(f"[bg-ingest] {ticker} failed: {e}")
 
-                                threading.Thread(
-                                    target=_bg_ingest, args=(t, _job_id), daemon=True
-                                ).start()
-                                st.toast(f"Ingesting **{t}**...")
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Failed: {e}")
+                                    threading.Thread(
+                                        target=_bg_ingest, args=(t, _job_id), daemon=True
+                                    ).start()
+                                    st.toast(f"Ingesting **{t}**...")
+                                except Exception as e:
+                                    st.error(f"Failed: {e}")
 
-            if not watchlist:
-                st.caption("Add a ticker above to start building your watchlist.")
+                if not watchlist:
+                    st.caption("Add a ticker above to start building your watchlist.")
 
-            # Show refresh button while ingestion is running
-            if has_active:
-                if st.button("🔄 Refresh status", key="refresh_ingestion", use_container_width=True):
-                    st.rerun()
+            except Exception as e:
+                st.caption(f"Watchlist unavailable: {e}")
 
-        except Exception as e:
-            st.caption(f"Watchlist unavailable: {e}")
-
+        _watchlist_status()
         st.markdown("---")
 
     st.markdown(f"""
