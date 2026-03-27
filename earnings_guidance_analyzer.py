@@ -884,19 +884,52 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
             "fy_eps_high": p.get("fy_eps_high"),
         })
 
-    # Sanitize FY walk: drop outlier revisions that are likely LLM errors
-    # (e.g., confusing quarterly actuals with FY guidance, or mixing revenue metrics).
-    # Within a fiscal year's revisions, guidance typically changes by <15% total.
-    # A single step jumping >20% is almost certainly wrong data.
+    # Sanitize FY walk: multiple passes to catch different error types.
+
+    # Pass 1: Ensure revisions are sorted by filing_date within each FY.
+    for fy in fy_walk:
+        fy_walk[fy].sort(key=lambda r: r["filing_date"])
+
+    # Pass 2: Validate source quarters belong to this FY's guidance window.
+    # For CY20XX (or FY20XX), valid source quarters are Q4 of (XX-1) through Q3 of XX.
+    # If a revision's source_q doesn't match (e.g., CY2024-Q3 giving CY2025 guidance),
+    # it's likely an LLM mislabel — the FY target should have been CY2024 instead.
+    import re as _re
+    for fy in list(fy_walk.keys()):
+        m = _re.match(r"(CY|FY)(\d{4})", fy)
+        if not m:
+            continue
+        prefix, year_str = m.group(1), int(m.group(2))
+        revs = fy_walk[fy]
+        cleaned = []
+        for r in revs:
+            sq = r["source_q"] or ""
+            sq_m = _re.match(r"(CY|FY)(\d{4})-Q(\d)", sq)
+            if sq_m:
+                sq_year = int(sq_m.group(2))
+                sq_q = int(sq_m.group(3))
+                # Valid sources: Q4 of (year-1), or Q1-Q3 of (year)
+                is_valid = ((sq_year == year_str - 1 and sq_q == 4) or
+                            (sq_year == year_str and sq_q in (1, 2, 3)))
+                if is_valid:
+                    cleaned.append(r)
+                else:
+                    log(f"  {fy}: dropped misattributed revision from {sq} "
+                        f"(${r['fy_rev']:,.0f}M — wrong source quarter)")
+            else:
+                cleaned.append(r)  # Can't validate, keep it
+        if cleaned:
+            fy_walk[fy] = cleaned
+        elif revs:
+            fy_walk[fy] = revs  # Don't empty it out
+
+    # Pass 3: Drop outlier revisions that deviate >25% from median (metric mix-ups).
     for fy in list(fy_walk.keys()):
         revs = fy_walk[fy]
         if len(revs) < 2:
             continue
-        # Find the median FY rev across all revisions as the "expected" ballpark
         vals = sorted(r["fy_rev"] for r in revs)
         median_val = vals[len(vals) // 2]
-        # Drop any revision that deviates >25% from the median — it's likely a
-        # quarterly actual or wrong metric mistakenly parsed as FY guidance
         cleaned = [r for r in revs if abs(r["fy_rev"] - median_val) / median_val < 0.25]
         if len(cleaned) < len(revs):
             dropped = len(revs) - len(cleaned)
