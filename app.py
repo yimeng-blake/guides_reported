@@ -564,27 +564,75 @@ with st.sidebar:
     # ── Watchlist & Ingestion Status ─────────────────────────────
     if _db_available:
         st.markdown("**Watchlist**")
+
+        # Add-to-watchlist input
+        wl_col1, wl_col2 = st.columns([3, 1])
+        with wl_col1:
+            new_ticker = st.text_input(
+                "Add ticker", placeholder="e.g. DDOG", label_visibility="collapsed",
+                key="watchlist_add_input",
+            )
+        with wl_col2:
+            add_btn = st.button("Add", key="watchlist_add_btn", use_container_width=True)
+
+        if add_btn and new_ticker:
+            _new_t = new_ticker.strip().upper()
+            if _new_t:
+                try:
+                    # Check if already being ingested
+                    _existing_job = _db.get_latest_ingestion_job(_new_t)
+                    if _existing_job and _existing_job["status"] in ("pending", "running"):
+                        st.info(f"**{_new_t}** is already being ingested.")
+                    elif _db.ticker_exists_in_db(_new_t):
+                        _db.add_to_watchlist(_new_t)
+                        st.success(f"**{_new_t}** is already in the database. Ready to analyze!")
+                    else:
+                        _db.add_to_watchlist(_new_t)
+                        _job_id = _db.create_ingestion_job(_new_t)
+                        import threading
+                        from ingest import ingest_ticker as _ingest_fn
+
+                        def _bg_ingest(t, jid):
+                            try:
+                                _ingest_fn(t, job_id=jid)
+                            except Exception as e:
+                                print(f"[bg-ingest] {t} failed: {e}")
+
+                        threading.Thread(
+                            target=_bg_ingest, args=(_new_t, _job_id), daemon=True
+                        ).start()
+                        st.toast(f"Ingesting **{_new_t}** — you can query other tickers in the meantime.")
+                except Exception as e:
+                    st.error(f"Failed to add {_new_t}: {e}")
+
         try:
             watchlist = _db.get_watchlist()
-            # Show active ingestion jobs
             active_jobs = _db.get_active_ingestion_jobs()
             active_tickers = {j["ticker"] for j in active_jobs}
+            has_active = False
 
             for entry in watchlist:
                 t = entry["ticker"]
                 if t in active_tickers:
+                    has_active = True
                     job = next(j for j in active_jobs if j["ticker"] == t)
-                    pct = job.get("progress", 0)
+                    pct = job.get("progress", 0) or 0
                     msg = job.get("message", "Ingesting...")
-                    st.markdown(f"**{t}** — {msg} ({pct}%)")
+                    st.markdown(f"⏳ **{t}** — {msg}")
                     st.progress(pct / 100)
                 elif entry.get("last_ingested_at"):
-                    st.markdown(f"**{t}** — Ready")
+                    st.markdown(f"✅ **{t}**")
                 else:
-                    st.markdown(f"**{t}** — Pending")
+                    st.markdown(f"⏸️ **{t}** — Not yet ingested")
 
             if not watchlist:
-                st.caption("No tickers in watchlist yet. Analyze a ticker to add it.")
+                st.caption("Add a ticker above to start building your watchlist.")
+
+            # Show refresh button while ingestion is running
+            if has_active:
+                if st.button("🔄 Refresh status", key="refresh_ingestion", use_container_width=True):
+                    st.rerun()
+
         except Exception as e:
             st.caption(f"Watchlist unavailable: {e}")
 
