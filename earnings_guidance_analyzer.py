@@ -23,6 +23,7 @@ import math
 import os
 import re
 import time
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -63,6 +64,42 @@ HEADERS = {"X-API-KEY": FD_API_KEY}
 
 claude_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
 
+
+# ── Adaptive Rate Limiter ──────────────────────────────────────────────
+class RateLimiter:
+    """Thread-safe adaptive rate limiter. Shared across all API call threads."""
+    def __init__(self, min_interval: float = 0.6, max_interval: float = 5.0):
+        self._lock = threading.Lock()
+        self._interval = min_interval
+        self._min = min_interval
+        self._max = max_interval
+        self._last_request = 0.0
+
+    def wait(self):
+        """Block until it's safe to make the next request."""
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request
+            if elapsed < self._interval:
+                time.sleep(self._interval - elapsed)
+            self._last_request = time.monotonic()
+
+    def back_off(self):
+        """Widen the interval after a 429 or transient error."""
+        with self._lock:
+            self._interval = min(self._interval * 1.5, self._max)
+
+    def ease_up(self):
+        """Gradually reduce interval after a successful request."""
+        with self._lock:
+            self._interval = max(self._interval * 0.9, self._min)
+
+    @property
+    def current_interval(self):
+        return self._interval
+
+_fd_rate_limiter = RateLimiter(min_interval=0.6, max_interval=5.0)
+
 # ── Styles ──────────────────────────────────────────────────────────────
 BEAT_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
 MISS_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
@@ -92,29 +129,43 @@ LOWER_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="so
 REAFFIRM_FILL = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
 
 
-# ── LLM parse cache ────────────────────────────────────────────────────
+# ── LLM parse cache (dual-layer: filesystem + session state) ──────────
 CACHE_DIR = Path.home() / ".cache" / "guidance_analyzer"
+
+
+def _session_cache() -> dict | None:
+    """Return the st.session_state cache dict, or None if not in Streamlit."""
+    try:
+        import streamlit as st
+        if "guidance_cache" not in st.session_state:
+            st.session_state["guidance_cache"] = {}
+        return st.session_state["guidance_cache"]
+    except Exception:
+        return None
+
 
 def _cache_key(ticker: str, filing_date: str, text: str) -> Path:
     """Build a cache file path from ticker, date, and a content hash."""
     h = hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest()[:12]
     return CACHE_DIR / f"{ticker}_{filing_date}_{h}.json"
 
+
 def _cache_get(ticker: str, filing_date: str, text: str | None = None) -> dict | None:
     """Return cached LLM parse result if it exists.
 
-    If text is provided, uses exact content-hash match.
+    Checks filesystem first, then falls back to Streamlit session state.
+    If text is provided, uses exact content-hash match for filesystem.
     If text is None, looks up by ticker+date prefix (any hash).
     """
+    # Layer 1: Filesystem cache
     if text is not None:
-        # Exact match by content hash
         p = _cache_key(ticker, filing_date, text)
         if p.exists():
             try:
                 return json.loads(p.read_text())
             except (json.JSONDecodeError, OSError):
-                return None
-    # Fallback: find any cache file for this ticker+date
+                pass
+    # Filesystem fallback: find any cache file for this ticker+date
     try:
         prefix = f"{ticker}_{filing_date}_"
         for p in CACHE_DIR.iterdir():
@@ -125,16 +176,32 @@ def _cache_get(ticker: str, filing_date: str, text: str | None = None) -> dict |
                     continue
     except (OSError, FileNotFoundError):
         pass
+
+    # Layer 2: Streamlit session state (survives re-runs on Cloud)
+    sc = _session_cache()
+    if sc is not None:
+        session_key = f"{ticker}_{filing_date}"
+        if session_key in sc:
+            return sc[session_key]
+
     return None
 
+
 def _cache_put(ticker: str, filing_date: str, text: str, result: dict):
-    """Write an LLM parse result to disk cache."""
+    """Write LLM parse result to both filesystem and session state."""
+    # Layer 1: Filesystem
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         p = _cache_key(ticker, filing_date, text)
         p.write_text(json.dumps(result))
     except OSError:
-        pass  # Non-fatal — just means next run will re-parse
+        pass  # Non-fatal
+
+    # Layer 2: Session state
+    sc = _session_cache()
+    if sc is not None:
+        session_key = f"{ticker}_{filing_date}"
+        sc[session_key] = result
 
 
 # ── API helpers ─────────────────────────────────────────────────────────
@@ -152,17 +219,20 @@ _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 def fetch_exhibit_text(ticker: str, accession: str, retries: int = 5) -> str | None:
     for attempt in range(retries + 1):
+        _fd_rate_limiter.wait()  # Global pacing — prevents 429 storms
         try:
             r = requests.get(f"{BASE_URL}/filings/items",
                 params={"ticker": ticker, "filing_type": "8-K",
                         "accession_number": accession, "include_exhibits": True},
                 headers=HEADERS, timeout=30)
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            _fd_rate_limiter.back_off()
             if attempt < retries:
                 time.sleep(2 * (attempt + 1))
                 continue
             return None
         if r.status_code == 200:
+            _fd_rate_limiter.ease_up()
             try:
                 for item in r.json().get("items", []):
                     for ex in item.get("exhibits", []):
@@ -175,9 +245,11 @@ def fetch_exhibit_text(ticker: str, accession: str, retries: int = 5) -> str | N
                 time.sleep(1.5)
                 continue
             return None
-        if r.status_code in _RETRYABLE_STATUS and attempt < retries:
-            time.sleep(2 * (attempt + 1))
-            continue
+        if r.status_code in _RETRYABLE_STATUS:
+            _fd_rate_limiter.back_off()
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
         return None
     return None
 
@@ -216,12 +288,30 @@ def _html_to_text(html: str) -> str:
     return parser.get_text()
 
 
+def _edgar_get(url: str, timeout: int = 15, retries: int = 2) -> requests.Response | None:
+    """GET with simple retry for EDGAR. Returns None on total failure."""
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, headers=EDGAR_HEADERS, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            if r.status_code in (429, 500, 502, 503) and attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return r  # Non-retryable status
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+    return None
+
+
 def _get_cik_for_ticker(ticker: str) -> str | None:
     """Resolve a stock ticker to an SEC CIK number."""
     try:
-        r = requests.get("https://www.sec.gov/files/company_tickers.json",
-                         headers=EDGAR_HEADERS, timeout=10)
-        r.raise_for_status()
+        r = _edgar_get("https://www.sec.gov/files/company_tickers.json", timeout=10)
+        if not r or r.status_code != 200:
+            return None
         for entry in r.json().values():
             if entry.get("ticker", "").upper() == ticker.upper():
                 return str(entry["cik_str"]).zfill(10)
@@ -235,9 +325,9 @@ def _fetch_edgar_8k_filings(ticker: str, cik: str) -> list[dict]:
     all_filings = []
     try:
         # Recent filings
-        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
-                         headers=EDGAR_HEADERS, timeout=15)
-        r.raise_for_status()
+        r = _edgar_get(f"https://data.sec.gov/submissions/CIK{cik}.json")
+        if not r or r.status_code != 200:
+            return all_filings
         data = r.json()
 
         def _extract_8ks(rec: dict) -> list[dict]:
@@ -263,9 +353,8 @@ def _fetch_edgar_8k_filings(ticker: str, cik: str) -> list[dict]:
             fname = f.get("name", "")
             if not fname:
                 continue
-            r2 = requests.get(f"https://data.sec.gov/submissions/{fname}",
-                              headers=EDGAR_HEADERS, timeout=15)
-            if r2.status_code == 200:
+            r2 = _edgar_get(f"https://data.sec.gov/submissions/{fname}")
+            if r2 and r2.status_code == 200:
                 all_filings.extend(_extract_8ks(r2.json()))
             time.sleep(0.2)  # Be polite to EDGAR
 
@@ -288,8 +377,8 @@ def _fetch_edgar_exhibit_text(filing: dict) -> str | None:
     try:
         # Get the filing index to find all documents
         idx_url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_path}/index.json"
-        r = requests.get(idx_url, headers=EDGAR_HEADERS, timeout=15)
-        if r.status_code != 200:
+        r = _edgar_get(idx_url)
+        if not r or r.status_code != 200:
             return None
 
         items = r.json().get("directory", {}).get("item", [])
@@ -313,8 +402,8 @@ def _fetch_edgar_exhibit_text(filing: dict) -> str | None:
         exhibit_name = htm_files[0][0]
 
         url = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_path}/{exhibit_name}"
-        r = requests.get(url, headers=EDGAR_HEADERS, timeout=20)
-        if r.status_code != 200:
+        r = _edgar_get(url, timeout=20)
+        if not r or r.status_code != 200:
             return None
 
         text = _html_to_text(r.text)
@@ -613,11 +702,9 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
         return None
 
     fetch_done = [0]
+    failed_filings = []
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {}
-        for f in filings:
-            futures[pool.submit(_fetch_primary_text, f)] = f
-            time.sleep(0.3)  # Stagger submissions to reduce 429s
+        futures = {pool.submit(_fetch_primary_text, f): f for f in filings}
         for future in as_completed(futures):
             fetch_done[0] += 1
             if fetch_done[0] % 10 == 0 or fetch_done[0] == total_primary:
@@ -626,9 +713,30 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
                 result = future.result()
                 if result:
                     filing_texts.append(result)
+                else:
+                    failed_filings.append(futures[future])
             except Exception as e:
                 filing = futures[future]
+                failed_filings.append(filing)
                 print(f"  [warn] Failed to fetch {filing.get('report_date', '?')}: {e}")
+
+    # ── Second pass: retry failed fetches sequentially with generous pacing ──
+    if failed_filings:
+        log(f"Retrying {len(failed_filings)} failed exhibit fetches (sequential)...")
+        _fd_rate_limiter.back_off()  # Preemptively slow down
+        for i, filing in enumerate(failed_filings):
+            time.sleep(2.0)  # Generous gap between retries
+            acc = filing.get("accession_number", "")
+            fd = filing.get("report_date", "?")
+            try:
+                text = fetch_exhibit_text(ticker, acc, retries=3)
+                if text and is_earnings_8k_quick(text):
+                    filing_texts.append((fd, text))
+                    log(f"  [recovered] {fd} ({i+1}/{len(failed_filings)})")
+                elif text:
+                    pass  # Not an earnings release, fine to skip
+            except Exception:
+                pass  # Already logged in first pass
 
     log(f"Found {len(filing_texts)} earnings releases to parse.")
 
