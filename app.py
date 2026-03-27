@@ -824,7 +824,15 @@ if "data" in st.session_state:
         total_raises = []
         for fy, revs in fy_walk.items():
             if len(revs) >= 2:
-                total_raises.append((revs[-1]["fy_rev"] / revs[0]["fy_rev"] - 1) * 100)
+                # Only count FYs where first entry is Q4 of prior year (true initial)
+                import re as _re
+                m = _re.match(r"(CY|FY)(\d{4})", fy)
+                if m:
+                    yr = int(m.group(2))
+                    sq = revs[0].get("source_q", "")
+                    sq_m = _re.match(r"(CY|FY)(\d{4})-Q(\d)", sq)
+                    if sq_m and int(sq_m.group(2)) == yr - 1 and int(sq_m.group(3)) == 4:
+                        total_raises.append((revs[-1]["fy_rev"] / revs[0]["fy_rev"] - 1) * 100)
         if fy_walk_rows:
             st.markdown(f'<div class="section-header">{T("fy_revision_pattern")}</div>', unsafe_allow_html=True)
 
@@ -858,6 +866,16 @@ if "data" in st.session_state:
                 html += f'<td style="padding: 8px 12px; font-weight: 600; color: var(--fg);">{fy}</td>'
 
                 initial = revs[0]["fy_rev"]
+                # Check if this FY has a proper Q4 initial
+                _fy_m = _re.match(r"(CY|FY)(\d{4})", fy)
+                _has_q4 = False
+                if _fy_m:
+                    _yr = int(_fy_m.group(2))
+                    _sq0 = revs[0].get("source_q", "")
+                    _sq0_m = _re.match(r"(CY|FY)(\d{4})-Q(\d)", _sq0)
+                    _has_q4 = (_sq0_m and int(_sq0_m.group(2)) == _yr - 1
+                               and int(_sq0_m.group(3)) == 4)
+
                 for i in range(max_revs):
                     if i < len(revs):
                         rev = revs[i]
@@ -865,10 +883,14 @@ if "data" in st.session_state:
                         cell = f"${val:,.0f}M"
                         subtitle = f"<br><span style='font-size:0.75rem; color:#888;'>({rev['source_q']})</span>"
 
-                        if i == 0:
-                            # Initial — neutral blue
+                        if i == 0 and _has_q4:
+                            # Proper Q4 initial — neutral blue
                             bg = "#e8f4fd"
                             color = "#1a1a2e"
+                        elif i == 0:
+                            # No Q4 initial — gray to indicate incomplete
+                            bg = "#f0f0f0"
+                            color = "#666"
                         else:
                             chg = val - revs[i-1]["fy_rev"]
                             chg_pct = (chg / revs[i-1]["fy_rev"]) * 100

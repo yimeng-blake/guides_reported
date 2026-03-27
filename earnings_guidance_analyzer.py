@@ -998,10 +998,11 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
     for fy in fy_walk:
         fy_walk[fy].sort(key=lambda r: r["filing_date"])
 
-    # Pass 2: Validate source quarters belong to this FY's guidance window.
-    # For CY20XX (or FY20XX), valid source quarters are Q4 of (XX-1) through Q3 of XX.
-    # If a revision's source_q doesn't match (e.g., CY2024-Q3 giving CY2025 guidance),
-    # it's likely an LLM mislabel — the FY target should have been CY2024 instead.
+    # Pass 2: Enforce that initial FY guidance must come from Q4 of prior year.
+    # Rule: For CY20XX, initial guide is given in CY(XX-1)-Q4. Revisions are Q1-Q3 of XX.
+    # Any entry not from this valid window is dropped.
+    # If Q4 initial is missing (fetch failure), the FY still shows but starts from
+    # the first available revision (Q1/Q2/Q3), clearly not the "initial".
     import re as _re
     for fy in list(fy_walk.keys()):
         m = _re.match(r"(CY|FY)(\d{4})", fy)
@@ -1009,6 +1010,8 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
             continue
         prefix, year_str = m.group(1), int(m.group(2))
         revs = fy_walk[fy]
+
+        # Filter to only valid source quarters
         cleaned = []
         for r in revs:
             sq = r["source_q"] or ""
@@ -1016,7 +1019,7 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
             if sq_m:
                 sq_year = int(sq_m.group(2))
                 sq_q = int(sq_m.group(3))
-                # Valid sources: Q4 of (year-1), or Q1-Q3 of (year)
+                # Valid: Q4 of (year-1) = initial, Q1-Q3 of (year) = revisions
                 is_valid = ((sq_year == year_str - 1 and sq_q == 4) or
                             (sq_year == year_str and sq_q in (1, 2, 3)))
                 if is_valid:
@@ -1025,11 +1028,27 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
                     log(f"  {fy}: dropped misattributed revision from {sq} "
                         f"(${r['fy_rev']:,.0f}M — wrong source quarter)")
             else:
-                cleaned.append(r)  # Can't validate, keep it
-        if cleaned:
-            fy_walk[fy] = cleaned
-        elif revs:
-            fy_walk[fy] = revs  # Don't empty it out
+                cleaned.append(r)
+
+        if not cleaned:
+            if revs:
+                fy_walk[fy] = revs  # Don't empty
+            continue
+        fy_walk[fy] = cleaned
+
+        # Enforce: first entry must be Q4 of prior year (the initial guide).
+        # If it's not Q4, that means the Q4 filing was missed — don't show
+        # a partial walk with a wrong "initial". Keep it but mark no initial.
+        first_sq = cleaned[0].get("source_q", "")
+        first_m = _re.match(r"(CY|FY)(\d{4})-Q(\d)", first_sq)
+        if first_m:
+            first_year = int(first_m.group(2))
+            first_q = int(first_m.group(3))
+            if not (first_year == year_str - 1 and first_q == 4):
+                # No Q4 initial — this FY walk is incomplete.
+                # Still keep it (shows revisions), but the dashboard
+                # table will show it without a proper "initial" column.
+                log(f"  {fy}: no Q4 initial guide found (walk starts from {first_sq})")
 
     # Pass 3: Drop outlier revisions that deviate >25% from median (metric mix-ups).
     for fy in list(fy_walk.keys()):
@@ -1048,15 +1067,30 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
             # All revisions were outliers relative to each other — keep originals
             pass
 
+    # Tag each FY with whether it has a proper Q4 initial
+    _fy_has_q4_initial = {}
+    for fy in fy_walk:
+        m = _re.match(r"(CY|FY)(\d{4})", fy)
+        if m and fy_walk[fy]:
+            year_str = int(m.group(2))
+            first_sq = fy_walk[fy][0].get("source_q", "")
+            sq_m = _re.match(r"(CY|FY)(\d{4})-Q(\d)", first_sq)
+            _fy_has_q4_initial[fy] = (sq_m and int(sq_m.group(2)) == year_str - 1
+                                       and int(sq_m.group(3)) == 4)
+        else:
+            _fy_has_q4_initial[fy] = False
+
     fy_walk_rows = []
     for fy in sorted(fy_walk.keys()):
         revisions = fy_walk[fy]
+        has_initial = _fy_has_q4_initial.get(fy, False)
         initial = revisions[0]["fy_rev"]
         for i, rev in enumerate(revisions):
-            action = "INITIAL" if i == 0 else (
-                "RAISE" if rev["fy_rev"] > revisions[i-1]["fy_rev"] * 1.005 else
-                "LOWER" if rev["fy_rev"] < revisions[i-1]["fy_rev"] * 0.995 else
-                "REAFFIRM"
+            action = ("INITIAL" if i == 0 and has_initial else
+                      "INITIAL" if i == 0 else  # No Q4 — still first entry
+                      "RAISE" if rev["fy_rev"] > revisions[i-1]["fy_rev"] * 1.005 else
+                      "LOWER" if rev["fy_rev"] < revisions[i-1]["fy_rev"] * 0.995 else
+                      "REAFFIRM"
             )
             chg_vs_prior = rev["fy_rev"] - revisions[i-1]["fy_rev"] if i > 0 else None
             chg_vs_prior_pct = (chg_vs_prior / revisions[i-1]["fy_rev"] * 100) if chg_vs_prior and i > 0 else None
