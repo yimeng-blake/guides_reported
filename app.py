@@ -640,9 +640,9 @@ if analyze_btn and ticker_input:
             m = _re.search(r"(\d+)/(\d+)", msg)
             if m:
                 done, total = int(m.group(1)), int(m.group(2))
-                pct = 0.04 + (done / total) * 0.02  # 0.04 to 0.06
-                phase_text.markdown(f"**Phase 1/5** — Fetching EDGAR filing {done}/{total}...")
-                progress_bar.progress(min(pct, 0.06))
+                pct = 0.04 + (done / total) * 0.04  # 0.04 to 0.08
+                phase_text.markdown(f"**Phase 1/5** — Fetching older SEC filings ({done}/{total})...")
+                progress_bar.progress(min(pct, 0.08))
         elif "fetching" in msg_lower and "exhibit texts from primary" in msg_lower:
             phase_text.markdown(f"**Phase 1/5** — {msg.strip()}")
             progress_bar.progress(0.06)
@@ -713,6 +713,11 @@ if analyze_btn and ticker_input:
         elif "conservatism" in msg_lower:
             phase_text.markdown("**Phase 3/5** — Computing conservatism scores...")
             progress_bar.progress(0.80)
+        elif "retrying" in msg_lower and "failed exhibit" in msg_lower:
+            phase_text.markdown(f"**Phase 1/5** — ⏳ {msg.strip()}")
+            progress_bar.progress(0.08)
+        elif "[recovered]" in msg_lower:
+            phase_text.markdown(f"**Phase 1/5** — ✅ {msg.strip()}")
         elif "stock prices" in msg_lower:
             phase_text.markdown("**Phase 4/5** — Fetching stock prices (concurrent)...")
             progress_bar.progress(0.85)
