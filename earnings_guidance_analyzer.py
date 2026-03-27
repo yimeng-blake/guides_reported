@@ -142,30 +142,40 @@ def _cache_put(ticker: str, filing_date: str, text: str, result: dict):
 def fetch_8k_filings(ticker: str, limit: int = 200) -> list[dict]:
     r = requests.get(f"{BASE_URL}/filings",
         params={"ticker": ticker, "filing_type": "8-K", "limit": limit},
-        headers=HEADERS)
-    if r.status_code == 401 or r.status_code == 403:
+        headers=HEADERS, timeout=30)
+    if r.status_code in (401, 403):
         raise RuntimeError(f"FD API authentication failed (HTTP {r.status_code}). Check your FD_API_KEY.")
     r.raise_for_status()
     return r.json().get("filings", [])
 
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 def fetch_exhibit_text(ticker: str, accession: str, retries: int = 3) -> str | None:
     for attempt in range(retries + 1):
-        r = requests.get(f"{BASE_URL}/filings/items",
-            params={"ticker": ticker, "filing_type": "8-K",
-                    "accession_number": accession, "include_exhibits": True},
-            headers=HEADERS)
+        try:
+            r = requests.get(f"{BASE_URL}/filings/items",
+                params={"ticker": ticker, "filing_type": "8-K",
+                        "accession_number": accession, "include_exhibits": True},
+                headers=HEADERS, timeout=30)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
+            return None
         if r.status_code == 200:
-            for item in r.json().get("items", []):
-                for ex in item.get("exhibits", []):
-                    text = ex.get("text", "")
-                    if len(text) > 3000:
-                        return text
+            try:
+                for item in r.json().get("items", []):
+                    for ex in item.get("exhibits", []):
+                        text = ex.get("text", "")
+                        if len(text) > 3000:
+                            return text
+            except (ValueError, KeyError):
+                pass  # Bad JSON
             if attempt < retries:
                 time.sleep(1.5)
                 continue
             return None
-        if r.status_code == 429 and attempt < retries:
+        if r.status_code in _RETRYABLE_STATUS and attempt < retries:
             time.sleep(2 * (attempt + 1))
             continue
         return None
@@ -324,13 +334,16 @@ def fetch_income_statements(ticker: str, limit: int = 30) -> list[dict]:
 
 
 def fetch_stock_prices(ticker: str, start_date: str, end_date: str) -> list[dict]:
-    r = requests.get(f"{BASE_URL}/prices",
-        params={"ticker": ticker, "interval": "day",
-                "start_date": start_date, "end_date": end_date},
-        headers=HEADERS)
-    if r.status_code != 200:
+    try:
+        r = requests.get(f"{BASE_URL}/prices",
+            params={"ticker": ticker, "interval": "day",
+                    "start_date": start_date, "end_date": end_date},
+            headers=HEADERS, timeout=15)
+        if r.status_code != 200:
+            return []
+        return r.json().get("prices", [])
+    except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, ValueError):
         return []
-    return r.json().get("prices", [])
 
 
 # ── LLM Parser ─────────────────────────────────────────────────────────
@@ -467,12 +480,27 @@ def llm_parse_filing(text: str, ticker: str, log_fn=None) -> dict | None:
 
 
 def is_earnings_8k_quick(text: str) -> bool:
-    """Fast heuristic check: is this an earnings press release?"""
-    lower = text[:5000].lower()
-    has_quarter = any(q in lower for q in ["first quarter", "second quarter", "third quarter", "fourth quarter"])
-    has_results = any(kw in lower for kw in ["results", "financial results", "announces"])
-    has_revenue = any(kw in lower for kw in ["revenue", "net sales"])
-    return has_quarter and has_results and has_revenue
+    """Fast heuristic check: is this an earnings press release?
+    Uses a scoring system: need at least 2 of 3 signals to qualify."""
+    lower = text[:8000].lower()
+    has_quarter = any(q in lower for q in [
+        "first quarter", "second quarter", "third quarter", "fourth quarter",
+        " q1 ", " q2 ", " q3 ", " q4 ",
+        "q1 ", "q2 ", "q3 ", "q4 ",  # start of line
+        "three months ended", "six months ended", "twelve months ended",
+        "full year", "full-year", "fiscal year",
+    ])
+    has_results = any(kw in lower for kw in [
+        "results", "financial results", "announces", "reported",
+        "results of operations", "quarterly report", "earnings",
+    ])
+    has_revenue = any(kw in lower for kw in [
+        "revenue", "net sales", "product revenue", "subscription revenue",
+        "total revenue", "net revenue", "billings",
+    ])
+    # Need at least 2 of 3 signals (some filings omit "revenue" from the header)
+    score = sum([has_quarter, has_results, has_revenue])
+    return score >= 2
 
 
 # ── Math helpers ────────────────────────────────────────────────────────
@@ -555,10 +583,17 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
     if edgar_filings:
         log(f"Fetching {len(edgar_filings)} older EDGAR 8-K exhibit texts...")
         for i, filing in enumerate(edgar_filings):
+            fd = filing.get("filing_date", "?")
             log(f"  Fetching EDGAR filing {i+1}/{len(edgar_filings)}...")
-            text = _fetch_edgar_exhibit_text(filing)
+            try:
+                text = _fetch_edgar_exhibit_text(filing)
+            except Exception as e:
+                print(f"  [warn] EDGAR fetch failed for {fd}: {e}")
+                text = None
             if text and is_earnings_8k_quick(text):
                 filing_texts.append((filing["filing_date"], text))
+            elif text:
+                log(f"  [skipped] {fd} — failed earnings heuristic")
 
     # Primary API filings (concurrent with modest parallelism to avoid 429s)
     total_primary = len(filings)
@@ -566,9 +601,15 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
 
     def _fetch_primary_text(filing):
         acc = filing["accession_number"]
-        text = fetch_exhibit_text(ticker, acc)
+        fd = filing.get("report_date", "?")
+        try:
+            text = fetch_exhibit_text(ticker, acc)
+        except Exception:
+            return None
         if text and is_earnings_8k_quick(text):
-            return (filing["report_date"], text)
+            return (fd, text)
+        if text:
+            print(f"  [skipped] {fd} — failed earnings heuristic")
         return None
 
     fetch_done = [0]
@@ -578,9 +619,13 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
             fetch_done[0] += 1
             if fetch_done[0] % 10 == 0 or fetch_done[0] == total_primary:
                 log(f"  Fetched {fetch_done[0]}/{total_primary} exhibit texts...")
-            result = future.result()
-            if result:
-                filing_texts.append(result)
+            try:
+                result = future.result()
+                if result:
+                    filing_texts.append(result)
+            except Exception as e:
+                filing = futures[future]
+                print(f"  [warn] Failed to fetch {filing.get('report_date', '?')}: {e}")
 
     log(f"Found {len(filing_texts)} earnings releases to parse.")
 
@@ -664,11 +709,15 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(_parse_one, item): item for item in to_parse}
             for future in as_completed(futures):
-                filing_date, result = future.result()
                 parse_done[0] += 1
-                log(f"  Parsing {filing_date}... ({parse_done[0]}/{len(to_parse)})")
-                if result and result.get("is_earnings_release"):
-                    parsed.append(_result_to_entry(filing_date, result))
+                try:
+                    filing_date, result = future.result()
+                    log(f"  Parsing {filing_date}... ({parse_done[0]}/{len(to_parse)})")
+                    if result and result.get("is_earnings_release"):
+                        parsed.append(_result_to_entry(filing_date, result))
+                except Exception as e:
+                    item = futures[future]
+                    log(f"  [warn] Parse failed for {item[0]}: {e} ({parse_done[0]}/{len(to_parse)})")
 
     log("Normalizing and validating parsed data...")
     parsed.sort(key=lambda x: x["filing_date"])
