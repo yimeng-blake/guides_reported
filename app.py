@@ -623,7 +623,30 @@ with st.sidebar:
                 elif entry.get("last_ingested_at"):
                     st.markdown(f"✅ **{t}**")
                 else:
-                    st.markdown(f"⏸️ **{t}** — Not yet ingested")
+                    # Ticker in watchlist but never ingested (or ingestion failed)
+                    col_lbl, col_btn = st.columns([3, 1])
+                    with col_lbl:
+                        st.markdown(f"⏸️ **{t}**")
+                    with col_btn:
+                        if st.button("Ingest", key=f"ingest_{t}", use_container_width=True):
+                            try:
+                                _job_id = _db.create_ingestion_job(t)
+                                import threading
+                                from ingest import ingest_ticker as _ingest_fn
+
+                                def _bg_ingest(ticker, jid):
+                                    try:
+                                        _ingest_fn(ticker, job_id=jid)
+                                    except Exception as e:
+                                        print(f"[bg-ingest] {ticker} failed: {e}")
+
+                                threading.Thread(
+                                    target=_bg_ingest, args=(t, _job_id), daemon=True
+                                ).start()
+                                st.toast(f"Ingesting **{t}**...")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed: {e}")
 
             if not watchlist:
                 st.caption("Add a ticker above to start building your watchlist.")
