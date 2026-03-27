@@ -15,6 +15,7 @@ Output: Multi-sheet Excel workbook with:
   6. Seasonal Patterns
   7. Multi-Metric Accuracy
 """
+from __future__ import annotations
 
 import sys
 import json
@@ -633,15 +634,118 @@ def correlation(xs, ys):
     return num / (dx * dy)
 
 
+# ── Database-first query path ──────────────────────────────────────────
+
+def _db_row_to_parsed_entry(row: dict) -> dict:
+    """Convert a filings_parsed DB row to the same dict shape as _result_to_entry()."""
+    return {
+        "filing_date": str(row["filing_date"]),
+        "reported_q": row.get("reported_quarter"),
+        "actual_revenue": row.get("actual_revenue_millions"),
+        "actual_non_gaap_op_margin": row.get("actual_non_gaap_op_margin_pct"),
+        "revenue_metric": row.get("revenue_metric_name", "Revenue"),
+        "guide_target_q": row.get("next_q_target"),
+        "guide_low": row.get("next_q_rev_guide_low_millions"),
+        "guide_high": row.get("next_q_rev_guide_high_millions"),
+        "guide_op_margin": row.get("next_q_op_margin_guide_pct"),
+        "fy_target": row.get("fy_target"),
+        "fy_rev_low": row.get("fy_rev_guide_low_millions"),
+        "fy_rev_high": row.get("fy_rev_guide_high_millions"),
+        "fy_rev_growth_low": row.get("fy_rev_growth_low_pct"),
+        "fy_rev_growth_high": row.get("fy_rev_growth_high_pct"),
+        "fy_op_margin": row.get("fy_op_margin_guide_pct"),
+        "fy_fcf_margin": row.get("fy_fcf_margin_guide_pct"),
+        "fy_eps_low": row.get("fy_eps_guide_low"),
+        "fy_eps_high": row.get("fy_eps_guide_high"),
+    }
+
+
+def _db_stmt_to_dict(row: dict) -> dict:
+    """Convert an income_statements DB row to the same shape as the API response."""
+    return {
+        "fiscal_period": row.get("fiscal_period", ""),
+        "revenue": row.get("revenue"),
+        "gross_profit": row.get("gross_profit"),
+        "operating_income": row.get("operating_income"),
+        "net_income": row.get("net_income"),
+    }
+
+
+def query_from_db(ticker: str):
+    """Try to load all data from Neon Postgres.
+
+    Returns (parsed, stmts, price_lookup) if ticker exists, or None if not found.
+    - parsed: list of dicts matching _result_to_entry() shape
+    - stmts: list of income statement dicts matching API shape
+    - price_lookup: dict mapping date_str -> close price
+    """
+    try:
+        import db as _db
+    except ImportError:
+        return None
+
+    try:
+        if not _db.ticker_exists_in_db(ticker):
+            return None
+
+        filing_rows = _db.get_parsed_filings(ticker)
+        if not filing_rows:
+            return None
+
+        parsed = [_db_row_to_parsed_entry(r) for r in filing_rows]
+        stmt_rows = _db.get_income_statements(ticker)
+        stmts = [_db_stmt_to_dict(r) for r in stmt_rows]
+        price_rows = _db.get_stock_prices(ticker)
+        price_lookup = {str(r["date"]): r["close"] for r in price_rows}
+
+        return parsed, stmts, price_lookup
+    except Exception as e:
+        print(f"[db] Failed to query from DB: {e}")
+        return None
+
+
 # ── Core analysis ───────────────────────────────────────────────────────
 
 def build_all_data(ticker: str, progress_callback=None) -> dict:
-    """Master function that fetches and parses everything."""
+    """Master function that fetches and parses everything.
+
+    Tries the database first for instant results. Falls back to
+    live fetch+parse if the ticker isn't in the DB yet.
+    """
     def log(msg):
         print(msg)
         if progress_callback:
             progress_callback(msg)
 
+    # ── Try database first (instant path) ──────────────────────────
+    db_result = query_from_db(ticker)
+    if db_result is not None:
+        parsed, stmts, _db_price_lookup = db_result
+        log("Loaded from database (instant path)")
+
+        # Build stmt_by_fp from DB income statements
+        stmt_by_fp = {}
+        for s in stmts:
+            fp = s.get("fiscal_period", "")
+            if fp and not fp.startswith("FY") and not fp.startswith("CY"):
+                fp = "FY" + fp
+            stmt_by_fp[fp] = s
+
+        # Override stock price fetching to use DB data
+        _original_fetch_prices = fetch_stock_prices
+        def _db_fetch_prices(tkr, start_date, end_date):
+            """Use DB-stored prices instead of API call."""
+            try:
+                import db as _db
+                rows = _db.get_stock_prices_range(tkr, start_date, end_date)
+                return [{"time": str(r["date"]), "close": r["close"]} for r in rows]
+            except Exception:
+                return _original_fetch_prices(tkr, start_date, end_date)
+
+        # Jump to analysis (skip fetch+parse phase)
+        return _run_analysis(ticker, parsed, stmt_by_fp, _db_fetch_prices, log)
+
+    # ── Live fetch+parse path (fallback) ───────────────────────────
     log("Fetching 8-K filings from financialdatasets.ai...")
     filings = fetch_8k_filings(ticker)
 
@@ -858,12 +962,18 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
                     log(f"  [warn] Parse failed for {item[0]}: {e} ({parse_done[0]}/{len(to_parse)})")
 
     log("Normalizing and validating parsed data...")
+    return _run_analysis(ticker, parsed, stmt_by_fp, fetch_stock_prices, log)
+
+
+def _run_analysis(ticker: str, parsed: list[dict], stmt_by_fp: dict,
+                  price_fetch_fn, log) -> dict:
+    """Run all analysis modules on parsed filing data.
+
+    Shared analysis path used by both DB-first instant queries and live fetch+parse.
+    """
     parsed.sort(key=lambda x: x["filing_date"])
 
     # ── Normalize CY/FY prefixes ────────────────────────────────────
-    # The LLM sometimes inconsistently uses CY vs FY across filings for the
-    # same company (e.g., CY for Q1-Q3 but FY for Q4). Detect the majority
-    # prefix and normalize everything to it.
     prefix_counts = {"CY": 0, "FY": 0}
     for p in parsed:
         rq = p.get("reported_q") or ""
@@ -871,7 +981,6 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
         elif rq.startswith("FY"): prefix_counts["FY"] += 1
 
     if prefix_counts["CY"] > 0 and prefix_counts["FY"] > 0:
-        # Mixed prefixes — normalize to the majority
         majority = "CY" if prefix_counts["CY"] >= prefix_counts["FY"] else "FY"
         minority = "FY" if majority == "CY" else "CY"
         log(f"  Normalizing mixed {minority}/{majority} prefixes → all {majority}")
@@ -881,7 +990,7 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
                 if val and val.startswith(minority):
                     p[key] = majority + val[2:]
 
-    # Log parsed entries (after normalization so prefixes are consistent)
+    # Log parsed entries
     for entry in parsed:
         rev_str = f"${entry['actual_revenue']:,.0f}M" if entry["actual_revenue"] else "N/A"
         fy_label = entry["fy_target"] or "FY"
@@ -1190,7 +1299,7 @@ def build_all_data(ticker: str, progress_callback=None) -> dict:
         fd_dt = datetime.strptime(fd, "%Y-%m-%d")
         start = (fd_dt - timedelta(days=8)).strftime("%Y-%m-%d")
         end = (fd_dt + timedelta(days=8)).strftime("%Y-%m-%d")
-        prices = fetch_stock_prices(ticker, start, end)
+        prices = price_fetch_fn(ticker, start, end)
         if len(prices) < 3:
             return None
 

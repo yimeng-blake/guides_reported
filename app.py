@@ -11,6 +11,14 @@ from io import BytesIO, StringIO
 
 from earnings_guidance_analyzer import build_all_data, write_excel_to_bytes
 
+# Optional DB imports — gracefully degrade if not configured
+_db_available = False
+try:
+    import db as _db
+    _db_available = True
+except Exception:
+    pass
+
 # ── Translations ───────────────────────────────────────────────────────
 _TR = {
     # Sidebar
@@ -552,6 +560,36 @@ with st.sidebar:
     ticker_input = st.text_input(T("ticker_label"), value="SNOW", placeholder="e.g. SNOW, AAOI, MDB")
     analyze_btn = st.button(T("analyze_btn"), use_container_width=True)
     st.markdown("---")
+
+    # ── Watchlist & Ingestion Status ─────────────────────────────
+    if _db_available:
+        st.markdown("**Watchlist**")
+        try:
+            watchlist = _db.get_watchlist()
+            # Show active ingestion jobs
+            active_jobs = _db.get_active_ingestion_jobs()
+            active_tickers = {j["ticker"] for j in active_jobs}
+
+            for entry in watchlist:
+                t = entry["ticker"]
+                if t in active_tickers:
+                    job = next(j for j in active_jobs if j["ticker"] == t)
+                    pct = job.get("progress", 0)
+                    msg = job.get("message", "Ingesting...")
+                    st.markdown(f"**{t}** — {msg} ({pct}%)")
+                    st.progress(pct / 100)
+                elif entry.get("last_ingested_at"):
+                    st.markdown(f"**{t}** — Ready")
+                else:
+                    st.markdown(f"**{t}** — Pending")
+
+            if not watchlist:
+                st.caption("No tickers in watchlist yet. Analyze a ticker to add it.")
+        except Exception as e:
+            st.caption(f"Watchlist unavailable: {e}")
+
+        st.markdown("---")
+
     st.markdown(f"""
     <div style="font-size: 0.8rem; color: var(--fg-muted);">
     {T("sidebar_desc")}
@@ -598,11 +636,19 @@ def fmt_dollar(v):
 if analyze_btn and ticker_input:
     ticker = ticker_input.strip().upper()
 
+    # Add to watchlist if DB is available
+    if _db_available:
+        try:
+            _db.add_to_watchlist(ticker)
+        except Exception:
+            pass
+
     # Single placeholder that holds ALL loading UI — can be fully cleared
     loading_placeholder = st.empty()
 
     log_lines = []
     quarters_parsed = [0]
+    _db_instant = [False]  # flag: did we hit the DB fast path?
 
     # We need references to inner widgets, so we build them inside the placeholder
     # Using a container inside the empty placeholder
@@ -628,6 +674,12 @@ if analyze_btn and ticker_input:
     def progress_cb(msg):
         # Track phases and build a rich log
         msg_lower = msg.lower()
+        # DB instant path — skip all the loading UI
+        if "loaded from database" in msg_lower:
+            _db_instant[0] = True
+            phase_text.markdown("**Loaded from database** — running analysis...")
+            progress_bar.progress(0.90)
+            return
         if "Fetching 8-K" in msg:
             phase_text.markdown("**Phase 1/5** — Fetching SEC 8-K filings index...")
             progress_bar.progress(0.03)
