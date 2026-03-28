@@ -76,11 +76,16 @@ def ingest_ticker(ticker: str, job_id: int | None = None, log_fn=None):
             (ticker,),
         )
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        log(f"[{ticker}] Ingestion failed: {e}\n{tb}")
         if job_id:
+            # Store truncated traceback for debugging
+            error_detail = f"{e}\n{tb[-500:]}" if len(tb) > 500 else f"{e}\n{tb}"
             db.update_ingestion_job(
                 job_id, status="failed",
                 finished_at=datetime.utcnow().isoformat(),
-                error=str(e),
+                error=error_detail,
             )
         raise
 

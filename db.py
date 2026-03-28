@@ -241,8 +241,8 @@ def get_fiscal_prefix_for_ticker(ticker: str) -> str | None:
     """Get the dominant CY/FY prefix used in reported_quarter for a ticker."""
     rows = query(
         """SELECT
-             SUM(CASE WHEN reported_quarter LIKE 'FY%' THEN 1 ELSE 0 END) as fy_count,
-             SUM(CASE WHEN reported_quarter LIKE 'CY%' THEN 1 ELSE 0 END) as cy_count
+             SUM(CASE WHEN reported_quarter LIKE 'FY%%' THEN 1 ELSE 0 END) as fy_count,
+             SUM(CASE WHEN reported_quarter LIKE 'CY%%' THEN 1 ELSE 0 END) as cy_count
            FROM filings_parsed
            WHERE ticker = %s AND reported_quarter IS NOT NULL AND is_earnings_release = TRUE""",
         (ticker,),
