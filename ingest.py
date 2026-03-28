@@ -160,20 +160,24 @@ def _do_ingest(ticker: str, log, update_progress):
     log(f"[{ticker}] {len(filing_texts)} earnings releases to parse")
     update_progress(50, "Detecting revenue metric...")
 
-    # 4. Detect the company's primary revenue metric for consistency
-    #    First check DB for an established metric from prior ingestions.
-    #    If none exists (new ticker), probe the most recent filing to establish one.
+    # 4. Detect the company's primary revenue metric and fiscal year convention
+    #    First check DB for established values from prior ingestions.
+    #    If none exist (new ticker), probe the most recent filing to establish them.
     primary_metric = db.get_revenue_metric_for_ticker(ticker)
-    if not primary_metric and filing_texts:
-        # Sort by date descending, probe the latest filing
+    fiscal_prefix = db.get_fiscal_prefix_for_ticker(ticker)
+    if (not primary_metric or not fiscal_prefix) and filing_texts:
         probe_item = sorted(filing_texts, key=lambda x: x[0], reverse=True)[0]
-        log(f"[{ticker}] No established metric — probing {probe_item[0]} to detect...")
+        log(f"[{ticker}] Probing {probe_item[0]} to detect conventions...")
         probe_result = llm_parse_filing(probe_item[1], ticker)
-        if probe_result and probe_result.get("revenue_metric_name"):
-            primary_metric = probe_result["revenue_metric_name"]
-            log(f"[{ticker}] Detected primary revenue metric: {primary_metric}")
+        if probe_result:
+            if not primary_metric and probe_result.get("revenue_metric_name"):
+                primary_metric = probe_result["revenue_metric_name"]
+            if not fiscal_prefix and probe_result.get("reported_quarter"):
+                fiscal_prefix = "FY" if probe_result["reported_quarter"].startswith("FY") else "CY"
     if primary_metric:
         log(f"[{ticker}] Using revenue metric: {primary_metric}")
+    if fiscal_prefix:
+        log(f"[{ticker}] Using fiscal prefix: {fiscal_prefix}")
 
     update_progress(52, "Parsing filings with Claude AI...")
 
@@ -200,8 +204,10 @@ def _do_ingest(ticker: str, log, update_progress):
             log(f"[{ticker}] S3 upload failed for {filing_date}: {e}")
             s3_key = None
 
-        # LLM parse with enforced metric
-        result = llm_parse_filing(text, ticker, primary_revenue_metric=primary_metric)
+        # LLM parse with enforced metric and fiscal convention
+        result = llm_parse_filing(text, ticker,
+                                  primary_revenue_metric=primary_metric,
+                                  fiscal_year_prefix=fiscal_prefix)
         if not result:
             log(f"[{ticker}] LLM parse returned None for {filing_date}")
             return

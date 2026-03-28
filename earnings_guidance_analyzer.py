@@ -464,9 +464,9 @@ CRITICAL — Full-year vs quarterly confusion:
 - Use the SAME revenue metric consistently for both quarterly actuals AND full-year guidance. If the company guides on "subscription revenues", use subscription revenues for BOTH. Do NOT mix subscription revenue actuals with total revenue guidance or vice versa.
 
 CRITICAL — CY vs FY prefix:
-- Use "FY" ONLY if the company explicitly uses "Fiscal Year" or "Fiscal" in their reporting (e.g., Snowflake says "Fiscal 2026", ServiceNow says "Fiscal Year 2025"). These companies have fiscal years ending in January/February.
-- Use "CY" for ALL companies that report using calendar years (January-December), even if their Q4 report title says "Full-Year 2025 Results". A Q4 report covering "year ended December 31" is CY, not FY.
-- Be CONSISTENT across all filings for the same company. If Q1/Q2/Q3 are CY, then Q4 must also be CY.
+- Use "FY" ONLY if the company has a fiscal year that does NOT end on December 31 (e.g., Snowflake's fiscal year ends January 31, so "Fiscal 2026" → FY2026).
+- Use "CY" for ALL companies whose fiscal year ends December 31 (calendar year), even if the press release says "Full-Year 2025 Results" or "Fourth Quarter and Full Year". A Q4 report covering "year ended December 31" is CY, not FY.
+- Be CONSISTENT across all filings for the same company. Every quarter must use the same prefix.
 
 Return this exact JSON structure:
 {
@@ -492,13 +492,17 @@ Return this exact JSON structure:
 """
 
 
-def llm_parse_filing(text: str, ticker: str, log_fn=None, primary_revenue_metric: str | None = None) -> dict | None:
+def llm_parse_filing(text: str, ticker: str, log_fn=None,
+                     primary_revenue_metric: str | None = None,
+                     fiscal_year_prefix: str | None = None) -> dict | None:
     """Use Claude to extract structured data from an 8-K exhibit.
 
     Args:
         primary_revenue_metric: If set, forces the parser to use this specific
             revenue metric (e.g. "Subscription revenues") for consistency across
             all filings for the same company.
+        fiscal_year_prefix: "CY" or "FY" — if set, forces consistent use of
+            this prefix for reported_quarter, next_q_target, and fy_target.
     """
     # Smart truncation: always include the guidance/outlook section even if it's
     # far into the document. Many companies put guidance after the financial tables.
@@ -534,7 +538,7 @@ def llm_parse_filing(text: str, ticker: str, log_fn=None, primary_revenue_metric
             # Guidance is in the first 14k — standard truncation
             text = text[:16000] + "\n\n[...middle section truncated...]\n\n" + text[-8000:]
 
-    # Build user message with optional metric enforcement
+    # Build user message with optional metric/convention enforcement
     user_msg = f"Ticker: {ticker}\n\n"
     if primary_revenue_metric:
         user_msg += (
@@ -543,6 +547,20 @@ def llm_parse_filing(text: str, ticker: str, log_fn=None, primary_revenue_metric
             f"and revenue_metric_name. Do NOT use a different revenue metric (e.g., do not use total revenue "
             f"if the primary metric is subscription revenue, or vice versa).\n\n"
         )
+    if fiscal_year_prefix:
+        if fiscal_year_prefix == "CY":
+            user_msg += (
+                "IMPORTANT: This company uses CALENDAR years (January–December). "
+                "All reported_quarter, next_q_target, and fy_target fields MUST use the \"CY\" prefix "
+                "(e.g., CY2025-Q3, CY2026). Do NOT use \"FY\" — even if the press release says "
+                "\"Full-Year Results\" or \"Fourth Quarter and Full Year\", this is still a calendar year company.\n\n"
+            )
+        else:
+            user_msg += (
+                "IMPORTANT: This company uses a NON-CALENDAR fiscal year (fiscal year does NOT end December 31). "
+                "All reported_quarter, next_q_target, and fy_target fields MUST use the \"FY\" prefix "
+                "(e.g., FY2026-Q3, FY2027). Do NOT use \"CY\".\n\n"
+            )
     user_msg += f"Press release text:\n{text}"
 
     for attempt in range(4):

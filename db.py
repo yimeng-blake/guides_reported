@@ -237,6 +237,25 @@ def get_latest_filing_date(ticker: str) -> str | None:
     return None
 
 
+def get_fiscal_prefix_for_ticker(ticker: str) -> str | None:
+    """Get the dominant CY/FY prefix used in reported_quarter for a ticker."""
+    rows = query(
+        """SELECT
+             SUM(CASE WHEN reported_quarter LIKE 'FY%' THEN 1 ELSE 0 END) as fy_count,
+             SUM(CASE WHEN reported_quarter LIKE 'CY%' THEN 1 ELSE 0 END) as cy_count
+           FROM filings_parsed
+           WHERE ticker = %s AND reported_quarter IS NOT NULL AND is_earnings_release = TRUE""",
+        (ticker,),
+    )
+    if not rows:
+        return None
+    fy = rows[0]["fy_count"] or 0
+    cy = rows[0]["cy_count"] or 0
+    if fy == 0 and cy == 0:
+        return None
+    return "FY" if fy > cy else "CY"
+
+
 def get_revenue_metric_for_ticker(ticker: str) -> str | None:
     """Get the most common revenue_metric_name from parsed filings for a ticker."""
     rows = query(
