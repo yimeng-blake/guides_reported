@@ -442,12 +442,7 @@ LLM_PARSE_PROMPT = """You are a financial data extraction assistant. Given an ea
 
 INSTRUCTIONS:
 1. Identify which fiscal quarter this press release reports results for.
-2. Extract the ACTUAL revenue reported for that quarter (in millions USD). Use the company's PRIMARY guided revenue metric — this varies by company:
-   - Snowflake: "Product revenue"
-   - ServiceNow: "Subscription revenues"
-   - Walmart: "Net sales"
-   - Most others: "Total revenue" or just "Revenue"
-   The key is to use the SAME metric that the company gives guidance on, so we can compare apples to apples.
+2. Extract the ACTUAL revenue reported for that quarter (in millions USD). Use the company's PRIMARY guided revenue metric — this is the revenue line that the company gives forward guidance on. It varies by company (e.g., "Product revenue", "Subscription revenues", "Net sales", "Total revenue"). The key is to use the SAME metric that the company gives guidance on, so we can compare apples to apples.
 3. Extract NEXT-QUARTER guidance for revenue (the quarter AFTER the one being reported). This is forward-looking guidance in the "Guidance", "Outlook", "Business Outlook", or "Financial Outlook" section. Revenue guidance is typically a dollar range like "$X million to $Y million" or "$X billion to $Y billion" or "$X - $Y". Convert everything to millions USD. Use the same metric from step 2 (e.g., if the company guides on subscription revenue, extract subscription revenue guidance).
 4. Extract FULL-YEAR guidance for the relevant fiscal year's revenue. This may be a dollar amount range or a growth rate range. Convert dollar amounts to millions USD. Use the same revenue metric as steps 2-3.
 5. Extract any operating margin guidance (as a percentage). Companies typically guide on NON-GAAP operating margin.
@@ -455,7 +450,6 @@ INSTRUCTIONS:
 7. Determine if the company uses fiscal years (e.g., "Fiscal 2026" ending Jan 31) or calendar years.
 
 IMPORTANT:
-- "Product revenue" guidance and actuals should be used for Snowflake. For most other companies, use total revenue.
 - Guidance is FORWARD-LOOKING: if reporting Q3 results, the next-quarter guidance is for Q4.
 - Full-year guidance may reference the current fiscal year (being updated) or the next fiscal year (if reporting Q4 and giving initial FY guidance).
 - EVERY earnings release with a "Guidance" or "Outlook" section has full-year guidance — look carefully. Q4 earnings give the NEXT fiscal year's initial FY guide. Q1/Q2/Q3 earnings update the CURRENT fiscal year's FY guide.
@@ -468,7 +462,6 @@ CRITICAL — Full-year vs quarterly confusion:
 - The fy_rev_guide fields MUST contain FULL-YEAR (annual) revenue guidance, NOT quarterly revenue.
 - Full-year revenue guidance should be roughly 4x the quarterly revenue. If you find a number that looks like a single quarter's revenue, do NOT put it in the FY fields.
 - Use the SAME revenue metric consistently for both quarterly actuals AND full-year guidance. If the company guides on "subscription revenues", use subscription revenues for BOTH. Do NOT mix subscription revenue actuals with total revenue guidance or vice versa.
-- ServiceNow (NOW) guides on "Subscription revenues" — use subscription revenues for all fields.
 
 CRITICAL — CY vs FY prefix:
 - Use "FY" ONLY if the company explicitly uses "Fiscal Year" or "Fiscal" in their reporting (e.g., Snowflake says "Fiscal 2026", ServiceNow says "Fiscal Year 2025"). These companies have fiscal years ending in January/February.
@@ -499,8 +492,14 @@ Return this exact JSON structure:
 """
 
 
-def llm_parse_filing(text: str, ticker: str, log_fn=None) -> dict | None:
-    """Use Claude to extract structured data from an 8-K exhibit."""
+def llm_parse_filing(text: str, ticker: str, log_fn=None, primary_revenue_metric: str | None = None) -> dict | None:
+    """Use Claude to extract structured data from an 8-K exhibit.
+
+    Args:
+        primary_revenue_metric: If set, forces the parser to use this specific
+            revenue metric (e.g. "Subscription revenues") for consistency across
+            all filings for the same company.
+    """
     # Smart truncation: always include the guidance/outlook section even if it's
     # far into the document. Many companies put guidance after the financial tables.
     if len(text) > 25000:
@@ -535,6 +534,17 @@ def llm_parse_filing(text: str, ticker: str, log_fn=None) -> dict | None:
             # Guidance is in the first 14k — standard truncation
             text = text[:16000] + "\n\n[...middle section truncated...]\n\n" + text[-8000:]
 
+    # Build user message with optional metric enforcement
+    user_msg = f"Ticker: {ticker}\n\n"
+    if primary_revenue_metric:
+        user_msg += (
+            f"IMPORTANT: This company's established primary revenue metric is \"{primary_revenue_metric}\". "
+            f"You MUST use \"{primary_revenue_metric}\" for actual_revenue_millions, all guidance fields, "
+            f"and revenue_metric_name. Do NOT use a different revenue metric (e.g., do not use total revenue "
+            f"if the primary metric is subscription revenue, or vice versa).\n\n"
+        )
+    user_msg += f"Press release text:\n{text}"
+
     for attempt in range(4):
         try:
             resp = claude_client.messages.create(
@@ -542,7 +552,7 @@ def llm_parse_filing(text: str, ticker: str, log_fn=None) -> dict | None:
                 max_tokens=1000,
                 messages=[{
                     "role": "user",
-                    "content": f"Ticker: {ticker}\n\nPress release text:\n{text}"
+                    "content": user_msg
                 }],
                 system=LLM_PARSE_PROMPT,
             )

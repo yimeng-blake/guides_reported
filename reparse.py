@@ -30,6 +30,18 @@ def reparse_ticker(ticker: str, dry_run: bool = False):
 
     print(f"[{ticker}] Re-parsing {len(filings)} filings...")
 
+    # Detect primary revenue metric from the most recent filing first
+    primary_metric = None
+    most_recent = filings[-1]  # sorted by filing_date ASC
+    try:
+        probe_text = storage.download_raw_text(most_recent["s3_raw_path"])
+        probe_result = llm_parse_filing(probe_text, ticker)
+        if probe_result and probe_result.get("revenue_metric_name"):
+            primary_metric = probe_result["revenue_metric_name"]
+            print(f"[{ticker}] Detected primary revenue metric: {primary_metric}")
+    except Exception as e:
+        print(f"[{ticker}] Metric probe failed: {e}")
+
     for i, f in enumerate(filings):
         filing_date = str(f["filing_date"])
         s3_key = f["s3_raw_path"]
@@ -45,8 +57,8 @@ def reparse_ticker(ticker: str, dry_run: bool = False):
             print(f"    S3 download failed: {e}")
             continue
 
-        # Re-parse with current prompt
-        result = llm_parse_filing(text, ticker)
+        # Re-parse with current prompt and enforced metric
+        result = llm_parse_filing(text, ticker, primary_revenue_metric=primary_metric)
         if not result:
             print(f"    LLM parse returned None")
             continue

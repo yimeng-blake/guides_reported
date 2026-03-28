@@ -237,6 +237,22 @@ def get_latest_filing_date(ticker: str) -> str | None:
     return None
 
 
+def get_revenue_metric_for_ticker(ticker: str) -> str | None:
+    """Get the most common revenue_metric_name from parsed filings for a ticker."""
+    rows = query(
+        """SELECT revenue_metric_name, COUNT(*) as cnt
+           FROM filings_parsed
+           WHERE ticker = %s AND revenue_metric_name IS NOT NULL AND is_earnings_release = TRUE
+           GROUP BY revenue_metric_name
+           ORDER BY cnt DESC
+           LIMIT 1""",
+        (ticker,),
+    )
+    if rows and rows[0]["revenue_metric_name"]:
+        return rows[0]["revenue_metric_name"]
+    return None
+
+
 def ticker_exists_in_db(ticker: str) -> bool:
     """Check if a ticker has any parsed filings in the DB."""
     rows = query(
